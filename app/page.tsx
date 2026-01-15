@@ -1,65 +1,134 @@
-import Image from "next/image";
+"use client";
+
+import { useState } from "react";
 
 export default function Home() {
+  const [answer, setAnswer] = useState("");
+  const [response, setResponse] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
+
+  const speak = (text: string) => {
+    if (!voiceEnabled) return;
+    if (!window.speechSynthesis) return;
+
+    // stop any previous speech
+    window.speechSynthesis.cancel();
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 0.95;
+    utterance.pitch = 0.9;
+    utterance.volume = 1;
+
+    const voices = window.speechSynthesis.getVoices();
+    const preferred = voices.find(
+      (v) =>
+        v.name.toLowerCase().includes("male") ||
+        v.name.toLowerCase().includes("english")
+    );
+
+    if (preferred) {
+      utterance.voice = preferred;
+    }
+
+    window.speechSynthesis.speak(utterance);
+  };
+
+  const submitAnswer = async () => {
+    if (!answer.trim()) return;
+
+    setLoading(true);
+    setResponse("");
+
+    try {
+      const res = await fetch("/api/interview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer })
+      });
+
+      const data = await res.json();
+
+      if (data.error) {
+        setResponse(data.error);
+      } else {
+        setResponse(data.interviewer);
+        speak(data.interviewer);
+      }
+    } catch {
+      setResponse("Something went wrong. Try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
+    <main
+      style={{
+        minHeight: "100vh",
+        width: "100vw",
+        padding: "48px 20px",
+        fontFamily: "sans-serif",
+        fontSize: "24px",
+        fontWeight: 700,
+        backgroundImage:
+          "linear-gradient(rgba(0, 0, 0, 0.92), rgba(0, 0, 0, 0.92)), url('/bg.jpeg')",
+        backgroundSize: "cover",
+        backgroundPosition: "center",
+        backgroundRepeat: "no-repeat",
+        color: "#f5f5f5",
+        boxSizing: "border-box"
+      }}
+    >
+      <div
+        style={{
+          width: "100%",
+          maxWidth: 780,
+          margin: "0 auto"
+        }}
+      >
+        <h1>Jarvis Mock Interviewer</h1>
+        <p>Answer the interview question and Jarvis will respond.</p>
+
+        <textarea
+          value={answer}
+          onChange={(e) => setAnswer(e.target.value)}
+          placeholder="Type your interview answer here..."
+          rows={6}
+          style={{
+            width: "100%",
+            padding: 12,
+            marginTop: 12,
+            fontSize: "24px",
+            fontWeight: 700,
+            boxSizing: "border-box"
+          }}
         />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+
+        <div style={{ marginTop: 12 }}>
+          <button
+            onClick={submitAnswer}
+            disabled={loading}
+            style={{ padding: "10px 20px" }}
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+            {loading ? "Thinking..." : "Submit Answer"}
+          </button>
+
+          <button
+            onClick={() => setVoiceEnabled(!voiceEnabled)}
+            style={{ marginLeft: 12, padding: "10px 20px" }}
           >
-            Documentation
-          </a>
+            {voiceEnabled ? "Mute Jarvis 🔇" : "Unmute Jarvis 🔊"}
+          </button>
         </div>
-      </main>
-    </div>
+
+        {response && (
+          <div style={{ marginTop: 24 }}>
+            <h3>Jarvis</h3>
+            <p>{response}</p>
+          </div>
+        )}
+      </div>
+    </main>
   );
 }
