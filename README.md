@@ -9,6 +9,7 @@ AI-powered mock interview engine with real-time streaming follow-up question gen
 - Server-side safeguards for quota errors, malformed model responses, and retry/fallback behavior.
 - Optional voice input and browser speech synthesis for Jarvis responses.
 - Gemini-first runtime (`GEMINI_API_KEY`) with fallback to alternate free-tier-friendly Gemini models.
+- Basic in-memory rate limiting on `POST /api/interview` and `POST /api/transcribe`.
 
 ## Environment
 
@@ -21,6 +22,12 @@ GEMINI_MODEL=gemini-2.5-flash
 ```
 
 Add it to your environment (or `.env.local`) before running.
+
+```bash
+JARVIS_INTERVIEW_CODE=your_private_unlock_code
+```
+
+Keep all API keys server-side only. Do not expose them in client code or `NEXT_PUBLIC_*` variables.
 
 ## Run
 
@@ -65,6 +72,16 @@ curl -N -X POST http://localhost:3000/api/interview \
   -H \"Content-Type: application/json\" \
   -d '{\"action\":\"next\",\"sessionId\":\"<SESSION_ID_FROM_START>\",\"answer\":\"I led a team of 4 engineers on a full-stack rewrite using React and Node.\"}'
 ```
+
+## Hosting at `/jarvis`
+
+If you link to this app from another Next.js site, disable prefetch on the link:
+
+```tsx
+<Link href="/jarvis" prefetch={false}>Open Jarvis</Link>
+```
+
+This keeps Jarvis route code from being eagerly downloaded on unrelated pages.
 
 ## Question bank
 

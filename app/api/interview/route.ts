@@ -5,9 +5,11 @@ import {
   getQuestionProgress,
   isInterviewComplete,
   nextPlannedQuestion,
+  unlockSession,
   setActiveResumeQuestion,
   clearActiveResumeState,
   consumeResumeFollowUp,
+  appendQuestionPlan,
   markStandardQuestion,
   setResumeContext,
   setQuestionPlan,
@@ -16,9 +18,10 @@ import {
 } from "@/lib/interview/state";
 import { pickQuestionSet } from "@/lib/interview/question-bank";
 import { streamGeminiInterviewReply } from "@/lib/interview/gemini";
+import { consumeRateLimit, getClientIdentifier } from "@/lib/rate-limit";
 import { createRequire } from "module";
 
-type InterviewAction = "start" | "next";
+type InterviewAction = "start" | "next" | "unlock";
 
 type InterviewRequestBody = {
   sessionId?: string;
@@ -27,6 +30,7 @@ type InterviewRequestBody = {
   resume?: string;
   questionMode?: "behavioral" | "resume" | "both";
   includeFeedback?: unknown;
+  unlockCode?: unknown;
 };
 
 type QuestionMode = "behavioral" | "resume" | "both";
@@ -53,15 +57,26 @@ type StreamEvent =
       totalQuestions: number;
       finished: boolean;
     }
+  | {
+      type: "interview-locked";
+      reason: string;
+      sessionId: string;
+      questionIndex: number;
+      totalQuestions: number;
+    }
   | { type: "interview-feedback"; feedback: string }
   | { type: "interview-error"; error: string };
 
-const QUESTIONS_PER_SESSION = 5;
+const QUESTIONS_PER_SESSION = 2;
 const RESUME_FOLLOWUP_QUESTIONS_PER_ROUND = 2;
+const CONTINUE_QUESTION_BATCH = 2;
 const MAX_RESUME_QUESTIONS = 2;
 const RESUME_QUESTION_PREFIX = "RESUME::";
 const MAX_RESUME_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_RESUME_TEXT_CHARS = 12000;
+const UNLOCK_CODE = (process.env.JARVIS_INTERVIEW_CODE || "").trim();
+const INTERVIEW_RATE_LIMIT = 30;
+const INTERVIEW_WINDOW_MS = 60_000;
 
 function toBooleanFlag(value: unknown): boolean {
   return (
@@ -169,8 +184,10 @@ async function extractTextFromResumeFile(file: File): Promise<string> {
 }
 
 function buildResumeQuestionSetPrompt(resumeText: string): string {
-  return `Analyze this resume and produce exactly ${MAX_RESUME_QUESTIONS} interview questions that can be asked in a technical/behavioral interview.
-Use specifics from the resume only. Return strict JSON only in this format:
+  return `You are a senior software engineering interviewer.
+Analyze this resume and produce exactly ${MAX_RESUME_QUESTIONS} SDE interview questions.
+Each question must test engineering depth (architecture, trade-offs, performance, reliability, debugging, ownership, or delivery impact).
+Use only resume specifics. Return strict JSON only in this format:
 {"questions":["...","..."]}
 Resume:
 ${resumeText}`;
@@ -178,8 +195,8 @@ ${resumeText}`;
 
 function fallbackResumeQuestions(): string[] {
   return [
-    "Tell me about one of your strongest projects from your resume and the decision you made there.",
-    "Choose a challenge from your resume and explain your exact contribution and outcome."
+    "Pick one project from your resume and walk through the architecture, key trade-offs, and why they were chosen.",
+    "Choose a tough problem from your resume and explain your exact contribution, technical decisions, and measurable outcome."
   ];
 }
 
@@ -189,10 +206,11 @@ function buildResumeFollowUpPrompt(
   lastAnswer: string,
   round: number
 ): string {
-  return `You are an interviewer. The candidate was asked: "${resumeQuestion}".
+  return `You are a senior SDE interviewer. The candidate was asked: "${resumeQuestion}".
 Candidate answered: "${lastAnswer}".
-Ask one short follow-up question that deepens the same thread using the resume context below.
-No preamble, no feedback, only a single question.
+Ask one short follow-up question that deepens the same engineering thread.
+Prioritize one of: architecture decisions, trade-offs, scale/performance, reliability/testing, debugging process, ownership, or impact metrics.
+No preamble, no feedback, no analysis, only a single question.
 Resume context:
 ${resumeText}
 Follow-up round: ${round} of ${RESUME_FOLLOWUP_QUESTIONS_PER_ROUND}`;
@@ -202,11 +220,56 @@ function sanitizeQuestion(question: string): string {
   const text = question.trim();
   if (!text) return "";
 
+  const unfenced = text
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  try {
+    const parsed = JSON.parse(unfenced) as
+      | { question?: unknown; followUp?: unknown; questions?: unknown }
+      | unknown[];
+
+    if (Array.isArray(parsed)) {
+      const first = parsed.find((entry) => typeof entry === "string");
+      if (typeof first === "string" && first.trim()) {
+        return sanitizeQuestion(first);
+      }
+    } else if (parsed && typeof parsed === "object") {
+      const maybeObject = parsed as {
+        question?: unknown;
+        followUp?: unknown;
+        questions?: unknown;
+      };
+      if (typeof maybeObject.question === "string" && maybeObject.question.trim()) {
+        return sanitizeQuestion(maybeObject.question);
+      }
+      if (typeof maybeObject.followUp === "string" && maybeObject.followUp.trim()) {
+        return sanitizeQuestion(maybeObject.followUp);
+      }
+      if (Array.isArray(maybeObject.questions)) {
+        const first = maybeObject.questions.find((entry) => typeof entry === "string");
+        if (typeof first === "string" && first.trim()) {
+          return sanitizeQuestion(first);
+        }
+      }
+    }
+  } catch {
+    // Not JSON.
+  }
+
   const firstLine = text.split("\n")[0].trim();
   const stripped = firstLine
     .replace(/^(assistant:|jarvis:|question:)\s*/i, "")
     .replace(/^\(?\s*interviewer\s*:?\s*/i, "")
+    .replace(/^["']?\s*questions?\s*["']?\s*:\s*\[?\s*/i, "")
     .trim();
+
+  if (/^["']?\s*questions?\s*["']?\s*[:\[]/i.test(stripped)) {
+    return "";
+  }
+
   const match = stripped.match(/[^.!?]*\?/);
   if (match) return match[0].trim();
 
@@ -349,7 +412,21 @@ type ParsedNextRequest = {
   includeFeedback: boolean;
 };
 
-type ParsedRequestBody = ParsedStartRequest | ParsedNextRequest;
+type ParsedUnlockRequest = {
+  action: "unlock";
+  sessionId: string;
+  unlockCode: string;
+};
+
+type ParsedRequestBody = ParsedStartRequest | ParsedNextRequest | ParsedUnlockRequest;
+
+function ensureUnlockCode(raw: unknown): string {
+  return typeof raw === "string" ? raw.trim() : "";
+}
+
+function isValidUnlockCode(candidate: string): boolean {
+  return Boolean(UNLOCK_CODE) && candidate === UNLOCK_CODE;
+}
 
 async function parseInterviewRequest(req: Request): Promise<ParsedRequestBody> {
   const contentType = req.headers.get("content-type") || "";
@@ -357,7 +434,7 @@ async function parseInterviewRequest(req: Request): Promise<ParsedRequestBody> {
   if (contentType.includes("multipart/form-data")) {
     const formData = await req.formData();
     const action = String(formData.get("action") || "start").trim() as InterviewAction;
-    if (action !== "start" && action !== "next") {
+    if (action !== "start" && action !== "next" && action !== "unlock") {
       throw new Error("Invalid action.");
     }
 
@@ -386,6 +463,15 @@ async function parseInterviewRequest(req: Request): Promise<ParsedRequestBody> {
       };
     }
 
+    if (action === "unlock") {
+      const unlockCode = ensureUnlockCode(formData.get("unlockCode"));
+      return {
+        action: "unlock",
+        sessionId,
+        unlockCode
+      };
+    }
+
     return {
       action: "next",
       sessionId,
@@ -402,9 +488,9 @@ async function parseInterviewRequest(req: Request): Promise<ParsedRequestBody> {
 
   const body = (await req.json()) as InterviewRequestBody;
   const action = (body.action || "start") as InterviewAction;
-  if (action !== "start" && action !== "next") {
-    throw new Error("Invalid action.");
-  }
+  if (action !== "start" && action !== "next" && action !== "unlock") {
+      throw new Error("Invalid action.");
+    }
   const sessionId = body.sessionId?.trim() || "";
   const answer = typeof body.answer === "string" ? body.answer.trim() : "";
   const resumeText = normalizeResumeText(typeof body.resume === "string" ? body.resume : "");
@@ -421,6 +507,14 @@ async function parseInterviewRequest(req: Request): Promise<ParsedRequestBody> {
         hasResumeAttachment: false,
         includeFeedback: false
       };
+  }
+
+  if (action === "unlock") {
+    return {
+      action: "unlock",
+      sessionId,
+      unlockCode: ensureUnlockCode(body.unlockCode)
+    };
   }
 
   return {
@@ -485,6 +579,28 @@ function emitTextStream(
         totalQuestions,
         text,
         finished
+      })
+    )
+  );
+}
+
+function emitLocked(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  sessionId: string,
+  questionIndex: number,
+  totalQuestions: number,
+  reason: string
+): void {
+  const encoder = new TextEncoder();
+  const text = reason.trim() || "Trial limit reached. Enter the unlock code to continue.";
+  controller.enqueue(
+    encoder.encode(
+      toSse({
+        type: "interview-locked",
+        sessionId,
+        questionIndex,
+        totalQuestions,
+        reason: text
       })
     )
   );
@@ -584,6 +700,19 @@ async function generateFeedback(
 }
 
 export async function POST(req: Request) {
+  const rateResult = consumeRateLimit({
+    namespace: "api/interview",
+    identifier: getClientIdentifier(req),
+    limit: INTERVIEW_RATE_LIMIT,
+    windowMs: INTERVIEW_WINDOW_MS
+  });
+  if (!rateResult.allowed) {
+    return streamErrorResponse(
+      `Too many interview requests. Try again in ${rateResult.retryAfterSeconds}s.`,
+      429
+    );
+  }
+
   let body: ParsedRequestBody;
   try {
     body = await parseInterviewRequest(req);
@@ -592,20 +721,40 @@ export async function POST(req: Request) {
   }
 
   const shouldStart = body.action === "start";
-  const answer = body.answer;
+  const shouldUnlock = body.action === "unlock";
+  const shouldProgress = body.action === "next" || shouldUnlock;
   const cleanedSessionId = body.sessionId;
-  const resumeText = body.resume;
-  const questionMode = body.questionMode;
-  const includeFeedback = shouldStart ? false : body.includeFeedback;
+  const answer = shouldStart || shouldUnlock ? "" : body.action === "next" ? body.answer : "";
+  const resumeText = shouldStart ? body.resume : "";
+  const questionMode = shouldStart ? body.questionMode : "both";
+  const includeFeedback = body.action === "next" ? body.includeFeedback : false;
+  const unlockCode = shouldUnlock ? body.unlockCode : "";
   const hasResumeAttachment = shouldStart ? body.hasResumeAttachment : false;
   const apiKey = process.env.GEMINI_API_KEY;
 
-  if (!shouldStart && !cleanedSessionId) {
+  if (shouldProgress && !cleanedSessionId) {
     return streamErrorResponse("Session id is required for next. Start an interview first.", 400);
   }
 
-  if (!shouldStart && isEmpty(answer)) {
+  if (shouldProgress && body.action === "next" && isEmpty(answer)) {
     return streamErrorResponse("Answer is required before requesting the next question.", 400);
+  }
+
+  if (shouldUnlock) {
+    if (shouldUnlock && !cleanedSessionId) {
+      return streamErrorResponse("Session id is required to continue.", 400);
+    }
+
+    if (!UNLOCK_CODE) {
+      return streamErrorResponse(
+        "Unlock code is not configured on server. Set JARVIS_INTERVIEW_CODE in .env.local.",
+        400
+      );
+    }
+
+    if (!isValidUnlockCode(unlockCode)) {
+      return streamErrorResponse("Invalid unlock code.", 403);
+    }
   }
 
   if (shouldStart && questionMode !== "behavioral" && !resumeText && !hasResumeAttachment) {
@@ -644,13 +793,26 @@ export async function POST(req: Request) {
     return streamErrorResponse("No interview questions are available.", 500);
   }
 
-  if (!shouldStart) {
+  if (!shouldStart && !shouldUnlock) {
     addTurn(session, "user", answer);
+  }
+
+  if (shouldUnlock) {
+    if (!isInterviewComplete(session)) {
+      return streamErrorResponse("You are already in progress. Continue with the normal flow.", 409);
+    }
+
+    unlockSession(session);
+    const continuationSet = pickQuestionSet(
+      `${session.id}:continue:${session.questionPlan.length}`,
+      CONTINUE_QUESTION_BATCH
+    );
+    appendQuestionPlan(session, continuationSet);
   }
 
   const stream = new ReadableStream({
     async start(controller) {
-      const action: InterviewAction = shouldStart ? "start" : "next";
+      const action: "start" | "next" = shouldStart ? "start" : "next";
       const sessionId = session.id;
       let progress = getQuestionProgress(session);
 
@@ -708,6 +870,15 @@ export async function POST(req: Request) {
         const nextQuestion = nextPlannedQuestion(session);
 
         if (!nextQuestion) {
+          if (!session.isUnlocked && shouldStart === false && session.currentQuestionIndex >= QUESTIONS_PER_SESSION) {
+            const lockText = "Trial limit reached. Enter the unlock code to continue the interview.";
+            addTurn(session, "assistant", lockText);
+            progress = getQuestionProgress(session);
+            emitLocked(controller, sessionId, progress.index, progress.total, lockText);
+            controller.close();
+            return;
+          }
+
           const completeText = isInterviewComplete(session)
             ? `Interview complete. You answered ${progress.total} questions. Great work today.`
             : "No questions are currently queued for this session.";

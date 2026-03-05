@@ -17,6 +17,7 @@ export interface InterviewSession {
   remainingResumeFollowUps: number;
   lastQuestionWasResume: boolean;
   resumeContext: string;
+  isUnlocked: boolean;
 }
 
 export interface GeminiHistoryTurn {
@@ -79,10 +80,37 @@ export function getOrCreateSession(sessionId?: string): InterviewSession {
     activeResumeQuestion: "",
     remainingResumeFollowUps: 0,
     lastQuestionWasResume: false,
-    resumeContext: ""
+    resumeContext: "",
+    isUnlocked: false
   };
   sessions.set(id, created);
   return created;
+}
+
+export function unlockSession(session: InterviewSession): void {
+  session.isUnlocked = true;
+  session.updatedAt = Date.now();
+}
+
+export function appendQuestionPlan(
+  session: InterviewSession,
+  questions: string[]
+): void {
+  if (!questions.length) return;
+
+  const existing = new Set(session.questionPlan.map((question) => question.trim()));
+  const normalized = questions
+    .map((question) => question.trim())
+    .filter(Boolean)
+    .filter((question, index, all) =>
+      all.findIndex((entry) => entry.trim() === question) === index
+    )
+    .filter((question) => !existing.has(question));
+
+  if (!normalized.length) return;
+
+  session.questionPlan = [...session.questionPlan, ...normalized];
+  session.updatedAt = Date.now();
 }
 
 export function setActiveResumeQuestion(

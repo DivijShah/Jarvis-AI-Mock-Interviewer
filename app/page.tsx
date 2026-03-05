@@ -25,10 +25,17 @@ type StreamEvent =
       totalQuestions: number;
       finished: boolean;
     }
+  | {
+      type: "interview-locked";
+      reason: string;
+      sessionId: string;
+      questionIndex: number;
+      totalQuestions: number;
+    }
   | { type: "interview-feedback"; feedback: string }
   | { type: "interview-error"; error: string };
 
-type InterviewAction = "start" | "next";
+type InterviewAction = "start" | "next" | "unlock";
 type QuestionMode = "behavioral" | "resume" | "both";
 type RequestOptions = {
   auto?: boolean;
@@ -61,25 +68,6 @@ function normalizeTranscript(raw: string): string {
   return (raw || "").trim().replace(/\s+/g, " ");
 }
 
-function mergeTranscriptWithOverlap(previous: string, incoming: string): string {
-  const previousWords = normalizeTranscript(previous).split(" ").filter(Boolean);
-  const incomingWords = normalizeTranscript(incoming).split(" ").filter(Boolean);
-
-  if (!previousWords.length) return incomingWords.join(" ");
-  if (!incomingWords.length) return previousWords.join(" ");
-
-  const maxOverlap = Math.min(previousWords.length, incomingWords.length);
-  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
-    const prevSlice = previousWords.slice(previousWords.length - overlap).join(" ");
-    const nextSlice = incomingWords.slice(0, overlap).join(" ");
-    if (prevSlice === nextSlice) {
-      return `${previousWords.concat(incomingWords.slice(overlap)).join(" ")}`;
-    }
-  }
-
-  return `${previousWords.join(" ")} ${incomingWords.join(" ")}`;
-}
-
 export default function Home() {
   const [sessionId, setSessionId] = useState("");
   const [answer, setAnswer] = useState("");
@@ -91,20 +79,22 @@ export default function Home() {
   const [isListening, setIsListening] = useState(false);
   const [interviewFinished, setInterviewFinished] = useState(false);
   const [questionIndex, setQuestionIndex] = useState(0);
-  const [totalQuestions, setTotalQuestions] = useState(5);
+  const [totalQuestions, setTotalQuestions] = useState(2);
   const [thinkingLeft, setThinkingLeft] = useState(0);
   const [awaitingAnswer, setAwaitingAnswer] = useState(false);
   const [feedbackText, setFeedbackText] = useState("");
   const [feedbackEnabled, setFeedbackEnabled] = useState(false);
   const [resumeFile, setResumeFile] = useState<File | null>(null);
   const [questionMode, setQuestionMode] = useState<QuestionMode>("behavioral");
+  const [interviewLocked, setInterviewLocked] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  const [unlockCode, setUnlockCode] = useState("");
   const canUseResumeMode = Boolean(resumeFile);
 
-  const recognitionRef = useRef<any>(null);
-  const voiceCaptureBaselineRef = useRef("");
-  const voiceCaptureAccumulatorRef = useRef("");
-  const voiceStoppedByUserRef = useRef(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const recordedChunksRef = useRef<BlobPart[]>([]);
+  const recordingTimeoutRef = useRef<number | null>(null);
   const jarvisVoice = useRef<SpeechSynthesisVoice | null>(null);
   const timerRef = useRef<number | null>(null);
   const requestRunningRef = useRef(false);
@@ -176,6 +166,22 @@ export default function Home() {
     }
   }, []);
 
+  const clearRecordingTimeout = useCallback(() => {
+    if (recordingTimeoutRef.current !== null) {
+      window.clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
+    }
+  }, []);
+
+  const stopMediaStream = useCallback(() => {
+    if (mediaStreamRef.current) {
+      for (const track of mediaStreamRef.current.getTracks()) {
+        track.stop();
+      }
+      mediaStreamRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     isPausedRef.current = isPaused;
   }, [isPaused]);
@@ -186,103 +192,147 @@ export default function Home() {
     }
   }, [canUseResumeMode, questionMode]);
 
-  const stopVoiceCapture = useCallback(() => {
-    voiceStoppedByUserRef.current = true;
-    isRecordingRef.current = false;
-    const active = recognitionRef.current;
-    if (active) {
-      try {
-        active.stop();
-      } catch {
-        // Ignore cleanup failures if recognition is already stopped.
-      }
+  const transcribeRecordedAudio = useCallback(async (audioBlob: Blob) => {
+    if (!audioBlob || audioBlob.size <= 0) {
+      setStatus("No audio captured. Please try recording again.");
+      return;
     }
-    setIsListening(false);
+
+    setStatus("Transcribing your answer...");
+    try {
+      const form = new FormData();
+      form.append("audio", audioBlob, `answer-${Date.now()}.webm`);
+
+      const res = await fetch("/api/transcribe", {
+        method: "POST",
+        body: form
+      });
+
+      const payload = await res.json().catch(() => ({} as { text?: string; error?: string }));
+      if (!res.ok) {
+        setStatus(payload?.error || "Transcription failed. You can type your answer.");
+        return;
+      }
+
+      const text = normalizeTranscript(typeof payload?.text === "string" ? payload.text : "");
+      if (!text) {
+        setStatus("No speech detected. Try again or type your answer.");
+        return;
+      }
+
+      setAnswer((prev) => normalizeTranscript(`${prev} ${text}`));
+      setStatus("Transcription added. Review and submit your answer.");
+    } catch {
+      setStatus("Transcription request failed. You can still type your answer.");
+    }
   }, []);
+
+  const stopVoiceCapture = useCallback(() => {
+    clearRecordingTimeout();
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      try {
+        recorder.stop();
+      } catch {
+        // Ignore cleanup failures if recorder is already stopped.
+      }
+      return;
+    }
+
+    isRecordingRef.current = false;
+    setIsListening(false);
+    stopMediaStream();
+  }, [clearRecordingTimeout, stopMediaStream]);
 
   const startVoiceCapture = useCallback(() => {
     if (isPaused || !awaitingAnswer || interviewFinished || !sessionId) return;
     stopVoiceCapture();
-    voiceStoppedByUserRef.current = false;
-    const Rec =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    clearTimer();
 
-    if (!Rec) {
-      setStatus("Speech recognition is unavailable in this browser.");
+    if (!navigator?.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setStatus("Audio recording is unavailable in this browser.");
       return;
     }
 
-    const recognition = new Rec();
-    voiceCaptureBaselineRef.current = answer.trim();
-    voiceCaptureAccumulatorRef.current = "";
-    recognition.lang = "en-US";
-    recognition.interimResults = true;
-    recognition.continuous = true;
-    isRecordingRef.current = true;
+    navigator.mediaDevices
+      .getUserMedia({ audio: true })
+      .then((stream) => {
+        mediaStreamRef.current = stream;
+        recordedChunksRef.current = [];
 
-    recognition.onstart = () => {
-      setIsListening(true);
-      if (awaitingAnswer) {
-        setStatus("Recording your answer. Speak clearly; you can continue up to 2 minutes.");
-      }
-    };
+        const mimeCandidates = [
+          "audio/webm;codecs=opus",
+          "audio/webm",
+          "audio/ogg;codecs=opus"
+        ];
+        const preferredMimeType =
+          mimeCandidates.find((candidate) => {
+            try {
+              return MediaRecorder.isTypeSupported(candidate);
+            } catch {
+              return false;
+            }
+          }) || "";
 
-    recognition.onresult = (event: any) => {
-      const results = Array.from(event.results);
-      const transcript = normalizeTranscript(
-        results
-          .map((entry: any) => entry?.[0]?.transcript || "")
-          .filter(Boolean)
-          .join(" ")
-      );
+        const recorder = preferredMimeType
+          ? new MediaRecorder(stream, { mimeType: preferredMimeType })
+          : new MediaRecorder(stream);
 
-      if (!transcript) return;
+        mediaRecorderRef.current = recorder;
+        isRecordingRef.current = true;
+        setIsListening(true);
+        setStatus("Recording your answer. Press Stop Recording when done.");
 
-      const merged = mergeTranscriptWithOverlap(
-        voiceCaptureAccumulatorRef.current,
-        transcript
-      );
-      voiceCaptureAccumulatorRef.current = merged;
-      const combined = `${voiceCaptureBaselineRef.current} ${merged}`.trim();
+        recorder.ondataavailable = (event) => {
+          if (event.data && event.data.size > 0) {
+            recordedChunksRef.current.push(event.data);
+          }
+        };
 
-      if (combined) {
-        setAnswer(combined);
-      }
-    };
+        recorder.onerror = () => {
+          setStatus("Recorder error. You can retry recording or type your answer.");
+        };
 
-    recognition.onerror = () => {
-      setStatus("Voice engine is having trouble. You can still type.");
-      voiceStoppedByUserRef.current = true;
-      isRecordingRef.current = false;
-      setIsListening(false);
-    };
-
-    recognition.onend = () => {
-      setIsListening(false);
-      if (voiceStoppedByUserRef.current) {
-        isRecordingRef.current = false;
-        return;
-      }
-
-      if (!isRecordingRef.current || !awaitingAnswer || interviewFinished || loading) return;
-
-      setTimeout(() => {
-        if (!isRecordingRef.current) return;
-
-        try {
-          recognition.start();
-          setIsListening(true);
-        } catch {
-          isRecordingRef.current = false;
+        recorder.onstop = () => {
+          clearRecordingTimeout();
           setIsListening(false);
-          setStatus("Press Record Answer again to resume speech capture.");
-        }
-      }, 80);
-    };
+          isRecordingRef.current = false;
 
-    recognitionRef.current = recognition;
-    recognition.start();
-  }, [answer, awaitingAnswer, stopVoiceCapture, isPaused, interviewFinished, loading, sessionId]);
+          const audioBlob = new Blob(recordedChunksRef.current, {
+            type: recorder.mimeType || "audio/webm"
+          });
+          recordedChunksRef.current = [];
+          stopMediaStream();
+          mediaRecorderRef.current = null;
+          void transcribeRecordedAudio(audioBlob);
+        };
+
+        recorder.start(250);
+
+        recordingTimeoutRef.current = window.setTimeout(() => {
+          if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+            setStatus("Max recording window reached (2 minutes). Stopping and transcribing...");
+            stopVoiceCapture();
+          }
+        }, THINKING_SECONDS * 1000);
+      })
+      .catch(() => {
+        setIsListening(false);
+        isRecordingRef.current = false;
+        stopMediaStream();
+        setStatus("Microphone access denied. You can still type your answer.");
+      });
+  }, [
+    awaitingAnswer,
+    stopVoiceCapture,
+    isPaused,
+    interviewFinished,
+    sessionId,
+    clearTimer,
+    clearRecordingTimeout,
+    stopMediaStream,
+    transcribeRecordedAudio
+  ]);
 
   const startThinkingTimer = useCallback((seconds = THINKING_SECONDS) => {
     clearTimer();
@@ -361,11 +411,32 @@ export default function Home() {
             setInterviewFinished(true);
             setAwaitingAnswer(false);
             setStatus("Interview completed. Excellent session.");
+            setInterviewLocked(false);
+            setUnlockCode("");
             clearTimer();
             setIsPaused(false);
           } else {
             startThinkingTimer();
           }
+          return;
+        }
+
+        if (event.type === "interview-locked") {
+          const lockedText =
+            event.reason || "Trial limit reached. Enter your unlock code to continue.";
+          setResponse(lockedText);
+          setConversation((prev) => [...prev, { role: "Jarvis", text: lockedText }]);
+          setQuestionIndex(event.questionIndex);
+          setTotalQuestions(event.totalQuestions);
+          setStatus(lockedText);
+          setInterviewFinished(true);
+          setInterviewLocked(true);
+          setAwaitingAnswer(false);
+          setLoading(false);
+          setResponse("");
+          setFeedbackText("");
+          clearTimer();
+          setIsPaused(false);
           return;
         }
 
@@ -397,10 +468,28 @@ export default function Home() {
       if (trailing.finished) {
         setInterviewFinished(true);
         setAwaitingAnswer(false);
+        setInterviewLocked(false);
+        setUnlockCode("");
         setIsPaused(false);
       } else {
         startThinkingTimer();
       }
+    } else if (trailing?.type === "interview-locked") {
+      const lockedText =
+        trailing.reason || "Trial limit reached. Enter your unlock code to continue.";
+      setResponse(lockedText);
+      setConversation((prev) => [...prev, { role: "Jarvis", text: lockedText }]);
+      setQuestionIndex(trailing.questionIndex);
+      setTotalQuestions(trailing.totalQuestions);
+      setStatus(lockedText);
+      setInterviewFinished(true);
+      setInterviewLocked(true);
+      setAwaitingAnswer(false);
+      setLoading(false);
+      setResponse("");
+      setFeedbackText("");
+      clearTimer();
+      setIsPaused(false);
     } else if (!response) {
       setStatus("No response received from service.");
       setLoading(false);
@@ -411,10 +500,23 @@ export default function Home() {
     async (action: InterviewAction, options: RequestOptions = {}) => {
       if (loading || requestRunningRef.current) return;
       if (isPaused && action === "next") return;
+      if (action === "next" && interviewLocked) return;
+      if (action === "next" && isListening) {
+        setStatus("Stop recording and wait for transcription before submitting.");
+        return;
+      }
       if (action === "next" && !options.auto && !answer.trim()) return;
       if (interviewFinished && action === "next") return;
       if (action === "start" && questionMode !== "behavioral" && !resumeFile) {
         setStatus("Upload your resume PDF to use resume-based questions.");
+        return;
+      }
+      if (action === "unlock" && !unlockCode.trim()) {
+        setStatus("Enter the unlock code to continue.");
+        return;
+      }
+      if (action === "unlock" && !sessionId) {
+        setStatus("Start an interview before trying to unlock.");
         return;
       }
 
@@ -431,9 +533,11 @@ export default function Home() {
       if (action === "start") {
         setConversation([]);
         setQuestionIndex(0);
-        setTotalQuestions(5);
+        setTotalQuestions(2);
         setInterviewFinished(false);
         setIsPaused(false);
+        setInterviewLocked(false);
+        setUnlockCode("");
         setFeedbackText("");
         setStatus("Booting session...");
         setSessionId("");
@@ -441,6 +545,11 @@ export default function Home() {
         if (rawAnswer.trim()) {
           setConversation((prev) => [...prev, { role: "You", text: rawAnswer }]);
         }
+      } else if (action === "unlock") {
+        setInterviewFinished(false);
+        setInterviewLocked(false);
+        setFeedbackText("");
+        setStatus("Validating unlock code...");
       }
 
       const hasResumeFile = action === "start" && Boolean(resumeFile);
@@ -457,12 +566,17 @@ export default function Home() {
         requestBody = form;
       } else {
         const body: Record<string, string | boolean> = { action };
+        if (action === "unlock") {
+          body.unlockCode = unlockCode;
+        }
         if (action === "next") {
           body.sessionId = sessionId;
           body.answer = answerToSend;
           if (feedbackEnabled) {
             body.includeFeedback = true;
           }
+        } else if (action === "unlock") {
+          body.sessionId = sessionId;
         } else if (action === "start") {
           body.questionMode = questionMode;
         }
@@ -523,8 +637,11 @@ export default function Home() {
       loading,
       sessionId,
       answer,
+      isListening,
       interviewFinished,
+      interviewLocked,
       isPaused,
+      unlockCode,
       resumeFile,
       questionMode,
       feedbackEnabled,
@@ -567,8 +684,13 @@ export default function Home() {
   }, [interviewFinished, loading, thinkingLeft, awaitingAnswer, startThinkingTimer]);
 
   useEffect(() => {
-    return () => clearTimer();
-  }, [clearTimer]);
+    return () => {
+      clearTimer();
+      stopVoiceCapture();
+      stopMediaStream();
+      clearRecordingTimeout();
+    };
+  }, [clearTimer, stopVoiceCapture, stopMediaStream, clearRecordingTimeout]);
 
   return (
     <main
@@ -872,16 +994,16 @@ export default function Home() {
 
               <button
                 onClick={submitAnswer}
-                disabled={loading || isPaused || !answer.trim() || interviewFinished}
+                disabled={loading || isPaused || isListening || !answer.trim() || interviewFinished}
                 style={{
                   border: "2px solid #fff",
                   background:
-                    loading || isPaused || !answer.trim() || interviewFinished ? "#999" : "#111",
+                    loading || isPaused || isListening || !answer.trim() || interviewFinished ? "#999" : "#111",
                   color:
-                    loading || isPaused || !answer.trim() || interviewFinished ? "#222" : "#fff",
+                    loading || isPaused || isListening || !answer.trim() || interviewFinished ? "#222" : "#fff",
                   padding: "10px 16px",
                   cursor:
-                    loading || isPaused || !answer.trim() || interviewFinished
+                    loading || isPaused || isListening || !answer.trim() || interviewFinished
                       ? "not-allowed"
                       : "pointer"
                 }}
@@ -889,6 +1011,48 @@ export default function Home() {
                 {loading ? "Thinking..." : "Submit Answer"}
               </button>
             </div>
+
+            {interviewLocked ? (
+              <div
+                style={{
+                  marginTop: 12,
+                  border: "2px solid #000",
+                  padding: 12,
+                  background: "#e9e9e9"
+                }}
+              >
+                <p style={{ margin: 0, fontSize: 12, fontWeight: 700 }}>
+                  Session locked after 2 questions. Enter code to continue.
+                </p>
+                <input
+                  type="password"
+                  value={unlockCode}
+                  onChange={(e) => setUnlockCode(e.target.value)}
+                  placeholder="Enter unlock code"
+                  style={{
+                    width: "100%",
+                    marginTop: 8,
+                    marginBottom: 8,
+                    border: "2px solid #000",
+                    padding: "8px",
+                    fontFamily: "Courier New, Courier, monospace"
+                  }}
+                />
+                <button
+                  onClick={() => requestInterview("unlock")}
+                  disabled={loading || !unlockCode.trim()}
+                  style={{
+                    border: "2px solid #000",
+                    padding: "10px 14px",
+                    background: loading || !unlockCode.trim() ? "#999" : "#111",
+                    color: loading || !unlockCode.trim() ? "#222" : "#fff",
+                    cursor: loading || !unlockCode.trim() ? "not-allowed" : "pointer"
+                  }}
+                >
+                  Continue with code
+                </button>
+              </div>
+            ) : null}
           </div>
         </section>
 
