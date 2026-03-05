@@ -1,36 +1,81 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Jarvis Mock Interviewer
 
-## Getting Started
+AI-powered mock interview engine with real-time streaming follow-up question generation and voice interaction.
 
-First, run the development server:
+## Features
+
+- Real-time streaming interview responses via `text/event-stream`.
+- Modular conversation state handling with session-scoped interview turns.
+- Server-side safeguards for quota errors, malformed model responses, and retry/fallback behavior.
+- Optional voice input and browser speech synthesis for Jarvis responses.
+- Gemini-first runtime (`GEMINI_API_KEY`) with fallback to alternate free-tier-friendly Gemini models.
+
+## Environment
+
+Set your API key and optional model:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+GEMINI_API_KEY=your_gemini_api_key
+# optional (defaults to gemini-2.5-flash)
+GEMINI_MODEL=gemini-2.5-flash
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Add it to your environment (or `.env.local`) before running.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Run
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npm install
+npm run dev
+```
 
-## Learn More
+Open [http://localhost:3000](http://localhost:3000).
 
-To learn more about Next.js, take a look at the following resources:
+## API
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+`POST /api/interview`
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Request body:
 
-## Deploy on Vercel
+- `action`: `start` to begin interview, `next` for follow-up
+- `sessionId`: optional existing session id
+- `answer`: candidate answer (required for `next`)
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Responses are delivered as SSE events:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- `interview-meta`
+- `interview-token`
+- `interview-complete`
+- `interview-error`
+
+## Quick API examples
+
+Start a fresh interview session:
+
+```bash
+curl -N -X POST http://localhost:3000/api/interview \
+  -H \"Content-Type: application/json\" \
+  -d '{\"action\":\"start\"}'
+```
+
+Send your answer and get a follow-up:
+
+```bash
+curl -N -X POST http://localhost:3000/api/interview \
+  -H \"Content-Type: application/json\" \
+  -d '{\"action\":\"next\",\"sessionId\":\"<SESSION_ID_FROM_START>\",\"answer\":\"I led a team of 4 engineers on a full-stack rewrite using React and Node.\"}'
+```
+
+## Question bank
+
+Behavioral engineering prompts are seeded from:
+
+- `lib/interview/question-bank.ts` (`ENGINEERING_BEHAVIORAL_QUESTIONS`)
+
+Replace this list with your own questions and keep the structure:
+
+```ts
+export const ENGINEERING_BEHAVIORAL_QUESTIONS = [
+  "Tell me about a time you..."
+];
+```
